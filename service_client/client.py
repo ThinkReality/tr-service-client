@@ -1,0 +1,319 @@
+import aiohttp
+import asyncio
+import uuid
+import time
+from typing import Dict, Any, Optional, List
+from .discovery import ServiceDiscovery
+from .circuit_breaker import LocalCircuitBreaker, CircuitBreakerConfig
+from .retry import RetryHandler, RetryConfig
+from .cache import LocalCache, CacheConfig
+from .metrics import MetricsCollector
+from .exceptions import *
+from pydantic import BaseModel, Field
+
+class ServiceClientConfig(BaseModel):
+    # API Gateway connection
+    gateway_url: str = Field(..., description="API Gateway base URL")
+    gateway_timeout: int = Field(default=30, description="Gateway timeout in seconds")
+    
+    # Service identification
+    service_name: str = Field(..., description="Name of this service")
+    service_token: str = Field(..., description="Service authentication token")
+    
+    # Default configurations
+    circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
+    retry: RetryConfig = Field(default_factory=RetryConfig)
+    cache: CacheConfig = Field(default_factory=CacheConfig)
+    
+    # Service-specific overrides
+    service_timeouts: Dict[str, int] = Field(default_factory=dict)
+    circuit_breakers: Dict[str, CircuitBreakerConfig] = Field(default_factory=dict)
+    
+    class Config:
+        env_prefix = "SERVICE_CLIENT_"
+        case_sensitive = False
+
+class ServiceClient:
+    """
+    Main client for service-to-service communication in ThinkRealty microservices
+    """
+    
+    def __init__(self, config: ServiceClientConfig):
+        self.config = config
+        self.service_name = config.service_name
+        self.service_token = config.service_token
+        
+        # Initialize components
+        self.discovery = ServiceDiscovery(config.gateway_url, config.service_token)
+        self.retry_handler = RetryHandler(config.retry)
+        self.cache = LocalCache(config.cache)
+        self.metrics = MetricsCollector(config.service_name)
+        
+        # Circuit breakers per target service
+        self._circuit_breakers: Dict[str, LocalCircuitBreaker] = {}
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        
+        # Request tracking
+        self._active_requests: Dict[str, asyncio.Task] = {}
+        
+    async def __aenter__(self):
+        await self.start()
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+        
+    async def start(self):
+        """Initialize the client"""
+        self._http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.config.gateway_timeout)
+        )
+        
+    async def close(self):
+        """Cleanup resources"""
+        if self._http_session:
+            await self._http_session.close()
+            
+        # Cancel any active requests
+        for task in self._active_requests.values():
+            task.cancel()
+            
+    def _get_circuit_breaker(self, target_service: str) -> LocalCircuitBreaker:
+        """Get or create circuit breaker for target service"""
+        if target_service not in self._circuit_breakers:
+            # Use service-specific config if available, otherwise defaults
+            circuit_config = self.config.circuit_breakers.get(
+                target_service, 
+                self.config.circuit_breaker
+            )
+            self._circuit_breakers[target_service] = LocalCircuitBreaker(
+                name=f"{target_service}-circuit",
+                config=circuit_config
+            )
+        return self._circuit_breakers[target_service]
+    
+    async def call(
+        self,
+        target_service: str,
+        endpoint: str,
+        method: str = "GET",
+        data: Optional[Any] = None,
+        params: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        timeout: Optional[int] = None,
+        use_cache: bool = True,
+        use_circuit_breaker: bool = True,
+        use_retry: bool = True
+    ) -> Any:
+        """
+        Main method to call another service
+        """
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        try:
+            self.metrics.record_request(target_service, endpoint)
+            
+            # Step 1: Check circuit breaker
+            if use_circuit_breaker:
+                circuit_breaker = self._get_circuit_breaker(target_service)
+                if not circuit_breaker.can_execute():
+                    self.metrics.record_circuit_open(circuit_breaker.name)
+                    raise CircuitOpenError(target_service, circuit_breaker.name)
+            
+            # Step 2: Check local cache (for GET requests)
+            if use_cache and method.upper() == "GET":
+                cached_response = self.cache.get(target_service, endpoint, method, params or {})
+                if cached_response is not None:
+                    self.metrics.record_cache_hit()
+                    return cached_response
+                self.metrics.record_cache_miss()
+            
+            # Step 3: Execute with retry logic
+            if use_retry:
+                response = await self.retry_handler.execute_with_retry(
+                    operation=self._execute_request,
+                    operation_name=target_service,
+                    target_service=target_service,
+                    endpoint=endpoint,
+                    method=method,
+                    data=data,
+                    params=params,
+                    headers=headers,
+                    timeout=timeout,
+                    request_id=request_id
+                )
+            else:
+                response = await self._execute_request(
+                    target_service=target_service,
+                    endpoint=endpoint,
+                    method=method,
+                    data=data,
+                    params=params,
+                    headers=headers,
+                    timeout=timeout,
+                    request_id=request_id
+                )
+            
+            # Step 4: Record success
+            if use_circuit_breaker:
+                await circuit_breaker.record_success()
+                
+            latency = time.time() - start_time
+            self.metrics.record_success(target_service, endpoint, latency)
+            
+            # Step 5: Cache successful GET responses
+            if use_cache and method.upper() == "GET":
+                self.cache.set(target_service, endpoint, method, params or {}, response)
+            
+            return response
+            
+        except Exception as e:
+            # Record failure
+            latency = time.time() - start_time
+            self.metrics.record_failure(target_service, endpoint, str(e))
+            
+            if use_circuit_breaker:
+                await circuit_breaker.record_failure()
+                
+            # If we have a cached response and the service is failing, return it
+            if use_cache and method.upper() == "GET":
+                cached_response = self.cache.get(target_service, endpoint, method, params or {})
+                if cached_response is not None:
+                    print(f"Returning cached response due to error: {e}")
+                    return cached_response
+                    
+            raise
+    
+    async def _execute_request(
+        self,
+        target_service: str,
+        endpoint: str,
+        method: str,
+        data: Optional[Any],
+        params: Optional[Dict],
+        headers: Optional[Dict],
+        timeout: Optional[int],
+        request_id: str
+    ) -> Any:
+        """
+        Execute a single HTTP request to the target service
+        """
+        # Step 1: Service discovery
+        discovery_response = await self.discovery.discover_service(target_service)
+        instance = discovery_response.selected_instance
+        
+        # Step 2: Build request URL and headers
+        url = f"http://{instance.host}:{instance.port}{endpoint}"
+        timeout = timeout or self.config.service_timeouts.get(target_service, 30)
+        
+        request_headers = {
+            "X-Service-Name": self.service_name,
+            "X-Service-Token": self.service_token,
+            "X-Request-ID": request_id,
+            "Content-Type": "application/json",
+            **(headers or {})
+        }
+        
+        # Step 3: Make HTTP request
+        async with self._http_session.request(
+            method=method.upper(),
+            url=url,
+            json=data,
+            params=params,
+            headers=request_headers,
+            timeout=timeout
+        ) as response:
+            
+            if response.status >= 200 and response.status < 300:
+                return await response.json()
+            elif response.status >= 400 and response.status < 500:
+                error_text = await response.text()
+                # Create a custom exception that the retry handler can inspect
+                raise ServiceClientError(f"Client error {response.status}: {error_text}", error_code=response.status)
+            else:
+                error_text = await response.text()
+                raise ServiceUnavailableError(
+                    service_name=target_service, reason=f"Service returned {response.status}: {error_text}"
+                )
+    
+    # Convenience methods
+    async def get(
+        self,
+        target_service: str,
+        endpoint: str,
+        params: Optional[Dict] = None,
+        **kwargs
+    ) -> Any:
+        return await self.call(target_service, endpoint, "GET", params=params, **kwargs)
+    
+    async def post(
+        self,
+        target_service: str,
+        endpoint: str,
+        data: Optional[Any] = None,
+        **kwargs
+    ) -> Any:
+        return await self.call(target_service, endpoint, "POST", data=data, **kwargs)
+    
+    async def put(
+        self,
+        target_service: str,
+        endpoint: str,
+        data: Optional[Any] = None,
+        **kwargs
+    ) -> Any:
+        return await self.call(target_service, endpoint, "PUT", data=data, **kwargs)
+    
+    async def delete(
+        self,
+        target_service: str,
+        endpoint: str,
+        **kwargs
+    ) -> Any:
+        return await self.call(target_service, endpoint, "DELETE", **kwargs)
+    
+    async def batch_call(
+        self,
+        requests: List[Dict[str, Any]]
+    ) -> List[Any]:
+        """
+        Execute multiple service calls concurrently
+        """
+        tasks = []
+        for req in requests:
+            task = self.call(
+                target_service=req["target_service"],
+                endpoint=req["endpoint"],
+                method=req.get("method", "GET"),
+                data=req.get("data"),
+                params=req.get("params"),
+                headers=req.get("headers"),
+                timeout=req.get("timeout"),
+                use_cache=req.get("use_cache", True),
+                use_circuit_breaker=req.get("use_circuit_breaker", True)
+            )
+            tasks.append(task)
+        
+        return await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Management methods
+    def get_circuit_state(self, target_service: str) -> str:
+        """Get circuit breaker state for a service"""
+        circuit = self._get_circuit_breaker(target_service)
+        return circuit.state
+    
+    async def reset_circuit(self, target_service: str):
+        """Reset circuit breaker for a service"""
+        circuit = self._get_circuit_breaker(target_service)
+        circuit.state = "CLOSED"
+        circuit.failure_count = 0
+        circuit.success_count = 0
+    
+    def clear_cache(self, target_service: Optional[str] = None):
+        """Clear local cache"""
+        self.cache.clear(target_service)
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get client metrics"""
+        return self.metrics.get_metrics()
