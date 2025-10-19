@@ -1,5 +1,6 @@
 import time
 import asyncio
+import aiohttp
 from typing import Dict, Optional
 from datetime import datetime, timedelta
 from .exceptions import CircuitOpenError
@@ -18,18 +19,29 @@ class CircuitBreakerConfig(BaseModel):
 
 
 class LocalCircuitBreaker:
-    def __init__(self, name: str, config: CircuitBreakerConfig):
+    def __init__(self, name: str, config: CircuitBreakerConfig, gateway_url: str = None, service_token: str = None):
         self.name = name
         self.config = config
+        self.gateway_url = gateway_url
+        self.service_token = service_token
         self.state = CircuitState.CLOSED
         self.failure_count = 0
         self.success_count = 0
         self.last_failure_time: Optional[float] = None
         self.last_state_change: float = time.time()
         self._lock = asyncio.Lock()
+        self._last_gateway_check: float = 0
+        self._gateway_check_interval: float = 10.0  # Check Gateway state every 10 seconds
 
-    def can_execute(self) -> bool:
-        """Check if request can proceed"""
+    async def can_execute(self) -> bool:
+        """Check if request can proceed (now async to check Gateway state)"""
+        # Check Gateway state periodically
+        current_time = time.time()
+        if (self.gateway_url and self.service_token and 
+            current_time - self._last_gateway_check > self._gateway_check_interval):
+            await self._sync_with_gateway()
+            self._last_gateway_check = current_time
+        
         if self.state == CircuitState.CLOSED:
             return True
         
@@ -86,6 +98,41 @@ class LocalCircuitBreaker:
         self.success_count = 0
         self.last_state_change = time.time()
         self._emit_state_change("CLOSED")
+
+    async def _sync_with_gateway(self):
+        """Sync local circuit breaker state with Gateway"""
+        if not self.gateway_url or not self.service_token:
+            return
+        
+        try:
+            # Use shorter timeout for Gateway circuit breaker queries
+            timeout = aiohttp.ClientTimeout(total=3, connect=1)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                headers = {
+                    "X-Service-Token": self.service_token,
+                    "Content-Type": "application/json"
+                }
+                url = f"{self.gateway_url}/internal/circuit-breaker/status/{self.name}"
+                
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        gateway_state = data.get("state", "CLOSED")
+                        
+                        # Sync with Gateway state
+                        if gateway_state == "OPEN" and self.state != CircuitState.OPEN:
+                            self._open_circuit()
+                        elif gateway_state == "CLOSED" and self.state != CircuitState.CLOSED:
+                            self._close_circuit()
+                    else:
+                        # Gateway returned error, continue with local state
+                        print(f"Gateway circuit breaker query failed with status {response.status}")
+        except asyncio.TimeoutError:
+            # Gateway timeout - continue with local state
+            print(f"Gateway circuit breaker query timed out for {self.name}")
+        except Exception as e:
+            # If Gateway check fails, continue with local state
+            print(f"Failed to sync with Gateway circuit breaker: {e}")
 
     def _emit_state_change(self, new_state: str):
         """Emit circuit state change for monitoring"""

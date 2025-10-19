@@ -3,7 +3,7 @@ import asyncio
 import uuid
 import time
 from typing import Dict, Any, Optional, List
-from .discovery import ServiceDiscovery
+# ServiceDiscovery removed - routing through Gateway
 from .circuit_breaker import LocalCircuitBreaker, CircuitBreakerConfig
 from .retry import RetryHandler, RetryConfig
 from .cache import LocalCache, CacheConfig
@@ -44,7 +44,7 @@ class ServiceClient:
         self.service_token = config.service_token
         
         # Initialize components
-        self.discovery = ServiceDiscovery(config.gateway_url, config.service_token)
+        # Note: Service discovery removed as we route through Gateway
         self.retry_handler = RetryHandler(config.retry)
         self.cache = LocalCache(config.cache)
         self.metrics = MetricsCollector(config.service_name)
@@ -55,6 +55,11 @@ class ServiceClient:
         
         # Request tracking
         self._active_requests: Dict[str, asyncio.Task] = {}
+        
+        # Gateway availability tracking
+        self._gateway_available: bool = True
+        self._last_gateway_check: float = 0
+        self._gateway_check_interval: float = 30.0  # Check every 30 seconds
         
     async def __aenter__(self):
         await self.start()
@@ -88,7 +93,9 @@ class ServiceClient:
             )
             self._circuit_breakers[target_service] = LocalCircuitBreaker(
                 name=f"{target_service}-circuit",
-                config=circuit_config
+                config=circuit_config,
+                gateway_url=self.config.gateway_url,
+                service_token=self.service_token
             )
         return self._circuit_breakers[target_service]
     
@@ -112,12 +119,12 @@ class ServiceClient:
         start_time = time.time()
         
         try:
-            self.metrics.record_request(target_service, endpoint)
+            self.metrics.record_request(target_service, endpoint, method)
             
             # Step 1: Check circuit breaker
             if use_circuit_breaker:
                 circuit_breaker = self._get_circuit_breaker(target_service)
-                if not circuit_breaker.can_execute():
+                if not await circuit_breaker.can_execute():
                     self.metrics.record_circuit_open(circuit_breaker.name)
                     raise CircuitOpenError(target_service, circuit_breaker.name)
             
@@ -160,7 +167,7 @@ class ServiceClient:
                 await circuit_breaker.record_success()
                 
             latency = time.time() - start_time
-            self.metrics.record_success(target_service, endpoint, latency)
+            self.metrics.record_success(target_service, endpoint, latency, method)
             
             # Step 5: Cache successful GET responses
             if use_cache and method.upper() == "GET":
@@ -171,7 +178,7 @@ class ServiceClient:
         except Exception as e:
             # Record failure
             latency = time.time() - start_time
-            self.metrics.record_failure(target_service, endpoint, str(e))
+            self.metrics.record_failure(target_service, endpoint, str(e), method)
             
             if use_circuit_breaker:
                 await circuit_breaker.record_failure()
@@ -197,16 +204,24 @@ class ServiceClient:
         request_id: str
     ) -> Any:
         """
-        Execute a single HTTP request to the target service
+        Execute a single HTTP request through the API Gateway
         """
-        # Step 1: Service discovery
-        discovery_response = await self.discovery.discover_service(target_service)
-        instance = discovery_response.selected_instance
-        
-        # Step 2: Build request URL and headers
-        url = f"http://{instance.host}:{instance.port}{endpoint}"
+        # Step 1: Build Gateway URL (route through Gateway instead of direct service call)
+        gateway_url = self.config.gateway_url.rstrip('/')
+        # Ensure endpoint starts with /
+        if not endpoint.startswith('/'):
+            endpoint = '/' + endpoint
+        url = f"{gateway_url}/gateway/{target_service}{endpoint}"
         timeout = timeout or self.config.service_timeouts.get(target_service, 30)
         
+        # Add Gateway availability check
+        if not self._is_gateway_available():
+            raise ServiceUnavailableError(
+                service_name="gateway", 
+                reason="API Gateway is unavailable"
+            )
+        
+        # Step 2: Build request headers for Gateway
         request_headers = {
             "X-Service-Name": self.service_name,
             "X-Service-Token": self.service_token,
@@ -215,7 +230,7 @@ class ServiceClient:
             **(headers or {})
         }
         
-        # Step 3: Make HTTP request
+        # Step 3: Make HTTP request through Gateway
         async with self._http_session.request(
             method=method.upper(),
             url=url,
@@ -228,14 +243,42 @@ class ServiceClient:
             if response.status >= 200 and response.status < 300:
                 return await response.json()
             elif response.status >= 400 and response.status < 500:
-                error_text = await response.text()
-                # Create a custom exception that the retry handler can inspect
-                raise ServiceClientError(f"Client error {response.status}: {error_text}", error_code=response.status)
+                # Parse Gateway error responses
+                await self._handle_error_response(response, target_service)
             else:
                 error_text = await response.text()
                 raise ServiceUnavailableError(
                     service_name=target_service, reason=f"Service returned {response.status}: {error_text}"
                 )
+    
+    async def _handle_error_response(self, response, target_service: str):
+        """Parse Gateway error responses"""
+        try:
+            error_data = await response.json()
+            
+            # Check for Gateway's structured error format
+            if "error" in error_data:
+                error_info = error_data["error"]
+                error_type = error_info.get("type", "Unknown")
+                message = error_info.get("message", "Unknown error")
+                correlation_id = error_info.get("correlation_id")
+                
+                raise GatewayErrorResponse(
+                    error_type=error_type,
+                    message=message,
+                    correlation_id=correlation_id
+                )
+            else:
+                # Fallback to generic error
+                error_text = await response.text()
+                raise ServiceClientError(f"Client error {response.status}: {error_text}", error_code=response.status)
+        except GatewayErrorResponse:
+            # Re-raise Gateway errors
+            raise
+        except Exception:
+            # Fallback to generic error
+            error_text = await response.text()
+            raise ServiceClientError(f"Client error {response.status}: {error_text}", error_code=response.status)
     
     # Convenience methods
     async def get(
@@ -317,3 +360,27 @@ class ServiceClient:
     def get_metrics(self) -> Dict[str, Any]:
         """Get client metrics"""
         return self.metrics.get_metrics()
+    
+    def _is_gateway_available(self) -> bool:
+        """Check if Gateway is available (simple cache-based check)"""
+        current_time = time.time()
+        
+        # Check if we need to refresh Gateway availability
+        if current_time - self._last_gateway_check > self._gateway_check_interval:
+            # In production, this would make a health check request
+            # For now, assume Gateway is available unless explicitly marked unavailable
+            self._last_gateway_check = current_time
+        
+        return self._gateway_available
+    
+    async def _check_gateway_health(self) -> bool:
+        """Perform actual Gateway health check"""
+        try:
+            health_url = f"{self.config.gateway_url.rstrip('/')}/health"
+            timeout = aiohttp.ClientTimeout(total=5)
+            
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(health_url) as response:
+                    return response.status == 200
+        except Exception:
+            return False

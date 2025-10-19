@@ -54,3 +54,13 @@ class InvalidConfigurationError(ServiceClientError):
         self.config_value = config_value
         error_message = message or f"Invalid configuration for key '{config_key}' with value '{config_value}'"
         super().__init__(error_message)
+
+class GatewayErrorResponse(ServiceClientError):
+    """Gateway-specific error response"""
+    def __init__(self, error_type: str, message: str, correlation_id: str = None):
+        self.error_type = error_type
+        self.correlation_id = correlation_id
+        error_message = f"{error_type}: {message}"
+        if correlation_id:
+            error_message += f" (correlation_id: {correlation_id})"
+        super().__init__(error_message)

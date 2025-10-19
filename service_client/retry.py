@@ -54,9 +54,17 @@ class RetryHandler:
                 if attempt == self.config.max_attempts:
                     break
                 
-                # Calculate delay and wait
-                delay = self._calculate_delay(attempt)
-                print(f"Attempt {attempt} failed for {operation_name}. Retrying in {delay:.2f}s. Error: {e}")
+                # Special handling for 429 (rate limiting)
+                if isinstance(e, ServiceClientError) and e.error_code == 429:
+                    # For 429, we should respect the Retry-After header if available
+                    # This would need to be passed from the HTTP response
+                    delay = self._calculate_delay(attempt)
+                    print(f"Rate limited (429) for {operation_name}. Retrying in {delay:.2f}s. Error: {e}")
+                else:
+                    # Calculate delay and wait
+                    delay = self._calculate_delay(attempt)
+                    print(f"Attempt {attempt} failed for {operation_name}. Retrying in {delay:.2f}s. Error: {e}")
+                
                 await asyncio.sleep(delay)
         
         # If we get here, all attempts failed
@@ -68,9 +76,10 @@ class RetryHandler:
 
     def _should_not_retry(self, error: Exception) -> bool:
         """Determine if we should not retry based on error type"""
-        # Don't retry on 4xx errors (client errors)
-        if isinstance(error, ServiceClientError) and error.error_code and 400 <= error.error_code < 500:
-            return True
+        # Don't retry on 4xx errors (client errors) except 429 (rate limiting)
+        if isinstance(error, ServiceClientError) and error.error_code:
+            if 400 <= error.error_code < 500 and error.error_code != 429:
+                return True
         
         # Don't retry on certain connection errors
         if isinstance(error, (ConnectionError, TimeoutError)):

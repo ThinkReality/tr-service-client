@@ -78,6 +78,15 @@ class LocalCache:
                 self.redis_client.delete(*keys_to_remove)
         else:
             self.redis_client.flushdb()
+    
+    def invalidate_gateway_transition(self):
+        """Invalidate all cache entries during Gateway transition"""
+        if not self.config.enabled or not self.redis_client:
+            return
+        
+        # Clear all cache entries to ensure fresh data with new routing
+        self.redis_client.flushdb()
+        print("Cache invalidated for Gateway transition")
 
     def get_stats(self) -> Dict[str, Union[int, float]]:
         """Get cache statistics"""
