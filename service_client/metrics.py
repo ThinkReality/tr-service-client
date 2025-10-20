@@ -3,47 +3,48 @@ from typing import Dict, Any, List
 from datetime import datetime
 from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, generate_latest
 
+# Prometheus metrics
+request_count = Counter(
+    'service_client_requests_total',
+    'Total requests made by service client',
+    ['service', 'method', 'status', 'target_service']
+)
+
+request_duration = Histogram(
+    'service_client_request_duration_seconds',
+    'Request duration in seconds',
+    ['service', 'method', 'target_service'],
+    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+)
+
+circuit_breaker_state = Gauge(
+    'service_client_circuit_breaker_state',
+    'Circuit breaker state (0=closed, 1=open, 2=half_open)',
+    ['service', 'target_service']
+)
+
+cache_hits = Counter(
+    'service_client_cache_hits_total',
+    'Total cache hits',
+    ['service', 'target_service']
+)
+
+cache_misses = Counter(
+    'service_client_cache_misses_total',
+    'Total cache misses',
+    ['service', 'target_service']
+)
+
+retries_total = Counter(
+    'service_client_retries_total',
+    'Total retry attempts',
+    ['service', 'target_service']
+)
+
+
 class MetricsCollector:
     def __init__(self, service_name: str):
         self.service_name = service_name
-        
-        # Prometheus metrics
-        self.request_count = Counter(
-            'service_client_requests_total',
-            'Total requests made by service client',
-            ['service', 'method', 'status', 'target_service']
-        )
-        
-        self.request_duration = Histogram(
-            'service_client_request_duration_seconds',
-            'Request duration in seconds',
-            ['service', 'method', 'target_service'],
-            buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
-        )
-        
-        self.circuit_breaker_state = Gauge(
-            'service_client_circuit_breaker_state',
-            'Circuit breaker state (0=closed, 1=open, 2=half_open)',
-            ['service', 'target_service']
-        )
-        
-        self.cache_hits = Counter(
-            'service_client_cache_hits_total',
-            'Total cache hits',
-            ['service', 'target_service']
-        )
-        
-        self.cache_misses = Counter(
-            'service_client_cache_misses_total',
-            'Total cache misses',
-            ['service', 'target_service']
-        )
-        
-        self.retries_total = Counter(
-            'service_client_retries_total',
-            'Total retry attempts',
-            ['service', 'target_service']
-        )
         
         # Legacy metrics for backward compatibility
         self._metrics: Dict[str, Any] = {
@@ -71,14 +72,14 @@ class MetricsCollector:
             self._latencies.pop(0)
         
         # Record Prometheus metrics
-        self.request_count.labels(
+        request_count.labels(
             service=self.service_name,
             method=method,
             status="success",
             target_service=target_service
         ).inc()
         
-        self.request_duration.labels(
+        request_duration.labels(
             service=self.service_name,
             method=method,
             target_service=target_service
@@ -89,7 +90,7 @@ class MetricsCollector:
         self._metrics["requests_failed"] += 1
         
         # Record Prometheus metrics
-        self.request_count.labels(
+        request_count.labels(
             service=self.service_name,
             method=method,
             status="failure",
@@ -102,14 +103,14 @@ class MetricsCollector:
         
         # Record Prometheus metrics
         if target_service:
-            self.circuit_breaker_state.labels(
+            circuit_breaker_state.labels(
                 service=self.service_name,
                 target_service=target_service
             ).set(1)  # 1 = OPEN
 
     def record_circuit_close(self, target_service: str):
         """Record circuit breaker closing"""
-        self.circuit_breaker_state.labels(
+        circuit_breaker_state.labels(
             service=self.service_name,
             target_service=target_service
         ).set(0)  # 0 = CLOSED
@@ -119,7 +120,7 @@ class MetricsCollector:
         self._metrics["cache_hits"] += 1
         
         # Record Prometheus metrics
-        self.cache_hits.labels(
+        cache_hits.labels(
             service=self.service_name,
             target_service=target_service
         ).inc()
@@ -129,7 +130,7 @@ class MetricsCollector:
         self._metrics["cache_misses"] += 1
         
         # Record Prometheus metrics
-        self.cache_misses.labels(
+        cache_misses.labels(
             service=self.service_name,
             target_service=target_service
         ).inc()
@@ -139,7 +140,7 @@ class MetricsCollector:
         self._metrics["retries_total"] += 1
         
         # Record Prometheus metrics
-        self.retries_total.labels(
+        retries_total.labels(
             service=self.service_name,
             target_service=target_service
         ).inc()
