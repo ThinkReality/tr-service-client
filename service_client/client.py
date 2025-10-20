@@ -132,9 +132,9 @@ class ServiceClient:
             if use_cache and method.upper() == "GET":
                 cached_response = self.cache.get(target_service, endpoint, method, params or {})
                 if cached_response is not None:
-                    self.metrics.record_cache_hit()
+                    self.metrics.record_cache_hit(target_service)
                     return cached_response
-                self.metrics.record_cache_miss()
+                self.metrics.record_cache_miss(target_service)
             
             # Step 3: Execute with retry logic
             if use_retry:
